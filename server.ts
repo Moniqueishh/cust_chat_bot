@@ -41,35 +41,65 @@ async function startServer() {
   }
 
   // Helper: Update Daily Stats
-  function updateStats(type: 'customer' | 'installer', category?: string, isNewThread: boolean = false) {
+  function updateStats(updates: {
+    linksSent?: number;
+    uniqueOpens?: number;
+    totalOpens?: number;
+    messageOpens?: number;
+    customerMessages?: number;
+    installerMessages?: number;
+    conversationCount?: number;
+    afterHoursMessages?: number;
+    responseTimeSum?: number;
+    responseTimeCount?: number;
+    tileClick?: string;
+    category?: string;
+  }) {
     const today = new Date().toISOString().split('T')[0];
     let stats = db.prepare('SELECT * FROM stats_daily WHERE date = ?').get(today) as any;
     
     if (!stats) {
-      db.prepare('INSERT INTO stats_daily (date, categories) VALUES (?, ?)').run(today, '{}');
-      stats = { date: today, messagesCustomer: 0, messagesInstaller: 0, threadsCreated: 0, categories: '{}' };
+      db.prepare('INSERT INTO stats_daily (date) VALUES (?)').run(today);
+      stats = db.prepare('SELECT * FROM stats_daily WHERE date = ?').get(today) as any;
     }
 
     const categories = JSON.parse(stats.categories || '{}');
-    if (category) {
-      categories[category] = (categories[category] || 0) + 1;
+    if (updates.category) {
+      categories[updates.category] = (categories[updates.category] || 0) + 1;
     }
 
-    db.prepare(`
-      UPDATE stats_daily 
-      SET 
-        messagesCustomer = messagesCustomer + ?, 
-        messagesInstaller = messagesInstaller + ?, 
-        threadsCreated = threadsCreated + ?,
-        categories = ?
-      WHERE date = ?
-    `).run(
-      type === 'customer' ? 1 : 0,
-      type === 'installer' ? 1 : 0,
-      isNewThread ? 1 : 0,
-      JSON.stringify(categories),
-      today
-    );
+    const tileClicks = JSON.parse(stats.tileClicks || '{}');
+    if (updates.tileClick) {
+      tileClicks[updates.tileClick] = (tileClicks[updates.tileClick] || 0) + 1;
+    }
+
+    const fields = [
+      'linksSent', 'uniqueOpens', 'totalOpens', 'messageOpens', 
+      'customerMessages', 'installerMessages', 'conversationCount', 
+      'afterHoursMessages', 'responseTimeSum', 'responseTimeCount'
+    ];
+
+    const updatesList = [];
+    const params = [];
+
+    fields.forEach(field => {
+      const val = (updates as any)[field];
+      if (val !== undefined) {
+        updatesList.push(`${field} = ${field} + ?`);
+        params.push(val);
+      }
+    });
+
+    updatesList.push(`categories = ?`);
+    params.push(JSON.stringify(categories));
+    
+    updatesList.push(`tileClicks = ?`);
+    params.push(JSON.stringify(tileClicks));
+
+    const query = `UPDATE stats_daily SET ${updatesList.join(', ')} WHERE date = ?`;
+    params.push(today);
+
+    db.prepare(query).run(...params);
   }
 
   // Debug middleware to verify if requests reach Express
@@ -155,6 +185,7 @@ async function startServer() {
             const customerName = `${projectData.firstName} ${projectData.lastName}`;
             const result = db.prepare('INSERT INTO threads (projectId, token, customerName) VALUES (?, ?, ?)').run(identifier, newToken, customerName);
             thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(result.lastInsertRowid) as any;
+            updateStats({ linksSent: 1 });
           } catch (err) {
             return res.status(404).json({ error: 'Invalid project ID.' });
           }
@@ -180,6 +211,8 @@ async function startServer() {
       };
 
       const messages = db.prepare('SELECT senderType, body, createdAt FROM messages WHERE threadId = ? ORDER BY createdAt ASC').all(thread.id);
+
+      updateStats({ totalOpens: 1 });
 
       res.json({
         threadId: thread.id,
@@ -215,12 +248,44 @@ async function startServer() {
 
       db.prepare("UPDATE threads SET lastMessageAt = CURRENT_TIMESTAMP, lastMessageText = ?, lastMessageSender = 'customer', needsResponse = 1, unreadForInstaller = 1 WHERE id = ?").run(body, thread.id);
       
-      updateStats('customer', category);
+      const now = new Date();
+      const hour = now.getHours();
+      const isOutsideBusinessHours = hour < 8 || hour >= 17;
+
+      // Check if this is the first message in the thread
+      const msgCount = db.prepare('SELECT COUNT(*) as count FROM messages WHERE threadId = ?').get(thread.id) as any;
+      
+      updateStats({ 
+        customerMessages: 1, 
+        category,
+        afterHoursMessages: isOutsideBusinessHours ? 1 : 0,
+        conversationCount: msgCount.count === 1 ? 1 : 0
+      });
       
       const updatedThread = db.prepare('SELECT * FROM threads WHERE id = ?').get(thread.id) as any;
       
       io.to(`thread-${thread.id}`).emit('new-message', message);
       io.to('admin-room').emit('thread-updated', updatedThread);
+
+      // --- Closed Hours Auto-Response ---
+      const lastAuto = updatedThread.lastAutoResponseAt ? new Date(updatedThread.lastAutoResponseAt) : null;
+      const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000);
+      const canSendAuto = !lastAuto || lastAuto < twelveHoursAgo;
+
+      if (isOutsideBusinessHours && canSendAuto) {
+        const autoBody = "Thanks for your message! Our team is currently offline. We'll respond during business hours.";
+        const autoResult = db.prepare('INSERT INTO messages (threadId, senderType, body, autoGenerated) VALUES (?, ?, ?, 1)').run(thread.id, 'installer', autoBody);
+        const autoMessage = db.prepare('SELECT * FROM messages WHERE id = ?').get(autoResult.lastInsertRowid) as any;
+        
+        db.prepare("UPDATE threads SET lastMessageAt = CURRENT_TIMESTAMP, lastMessageText = ?, lastMessageSender = 'installer', needsResponse = 0, unreadForCustomer = 1, lastAutoResponseAt = CURRENT_TIMESTAMP WHERE id = ?")
+          .run(autoBody, thread.id);
+        
+        const finalThread = db.prepare('SELECT * FROM threads WHERE id = ?').get(thread.id) as any;
+        
+        io.to(`thread-${thread.id}`).emit('new-message', autoMessage);
+        io.to('admin-room').emit('thread-updated', finalThread);
+      }
+      // ----------------------------------
 
       res.json({ success: true, message });
     } catch (err) {
@@ -272,7 +337,11 @@ async function startServer() {
 
       db.prepare("UPDATE threads SET lastMessageAt = CURRENT_TIMESTAMP, lastMessageText = ?, lastMessageSender = 'installer', needsResponse = 0, unreadForCustomer = 1 WHERE id = ?").run(body, tId);
       
-      updateStats('installer');
+      updateStats({ 
+        installerMessages: 1,
+        responseTimeSum: responseTime || 0,
+        responseTimeCount: responseTime ? 1 : 0
+      });
 
       const updatedThread = db.prepare('SELECT * FROM threads WHERE id = ?').get(tId) as any;
 
@@ -330,48 +399,47 @@ async function startServer() {
   // 3.3) getAdminStats()
   app.get("/api/admin/stats", async (req, res) => {
     try {
-      const today = new Date().toISOString().split('T')[0];
-      const last7Days = [];
-      for (let i = 0; i < 7; i++) {
-        const d = new Date();
-        d.setDate(d.getDate() - i);
-        last7Days.push(d.toISOString().split('T')[0]);
+      const { start, end } = req.query;
+      
+      let query = 'SELECT * FROM stats_daily';
+      const params = [];
+      
+      if (start && end) {
+        query += ' WHERE date >= ? AND date <= ?';
+        params.push(start, end);
+      } else {
+        const today = new Date().toISOString().split('T')[0];
+        query += ' WHERE date = ?';
+        params.push(today);
       }
-
-      const statsToday = db.prepare('SELECT * FROM stats_daily WHERE date = ?').get(today) as any || { messagesCustomer: 0, messagesInstaller: 0, threadsCreated: 0, categories: '{}' };
-      const allStatsLast7 = db.prepare(`SELECT * FROM stats_daily WHERE date IN (${last7Days.map(() => '?').join(',')})`).all(...last7Days) as any[];
-
+      
+      const stats = db.prepare(query).all(...params) as any[];
+      
       const needsResponseCount = db.prepare("SELECT COUNT(*) as count FROM threads WHERE needsResponse = 1 AND status = 'open'").get() as any;
       const openThreadsCount = db.prepare("SELECT COUNT(*) as count FROM threads WHERE status = 'open'").get() as any;
-      
-      // Avg response time (last 100 replies)
-      const avgRes = db.prepare('SELECT AVG(responseTime) as avg FROM messages WHERE responseTime IS NOT NULL ORDER BY createdAt DESC LIMIT 100').get() as any;
-
-      // Aggregate categories from last 7 days
-      const categoryTotals: Record<string, number> = {};
-      allStatsLast7.forEach(s => {
-        const cats = JSON.parse(s.categories || '{}');
-        Object.entries(cats).forEach(([name, count]) => {
-          categoryTotals[name] = (categoryTotals[name] || 0) + (count as number);
-        });
-      });
-
-      const topCategories = Object.entries(categoryTotals)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 5)
-        .map(([name, count]) => ({ name, count }));
 
       res.json({
+        stats,
         needsResponse: needsResponseCount.count,
-        openThreads: openThreadsCount.count,
-        messagesToday: statsToday.messagesCustomer + statsToday.messagesInstaller,
-        avgResponseTime: avgRes.avg || 0,
-        topCategories
+        openThreads: openThreadsCount.count
       });
     } catch (err) {
       console.error('[API Error] /api/admin/stats:', err);
       res.status(500).json({ error: 'Failed to load stats.', details: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  // 3.4) trackEvent()
+  app.post("/api/comms/event", (req, res) => {
+    const { event, tileName, isUnique } = req.body;
+    if (event === 'tile_click' && tileName) {
+      updateStats({ tileClick: tileName });
+    } else if (event === 'message_open') {
+      updateStats({ messageOpens: 1 });
+    } else if (event === 'page_open' && isUnique) {
+      updateStats({ uniqueOpens: 1 });
+    }
+    res.json({ success: true });
   });
 
   // 4) markProjectComplete(threadId)
