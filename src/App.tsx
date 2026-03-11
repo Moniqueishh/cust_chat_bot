@@ -1,4 +1,5 @@
 import React, { useEffect, useState, ReactNode, useRef } from 'react';
+import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { motion, AnimatePresence } from 'motion/react';
 import { io, Socket } from 'socket.io-client';
 import { 
@@ -21,11 +22,19 @@ import {
   Filter,
   BarChart3,
   TrendingUp,
-  Users
+  Users,
+  LogOut,
+  Mail,
+  Loader2,
+  ExternalLink,
+  Copy
 } from 'lucide-react';
-import { generateAssistantResponse, AssistantResponse } from './services/geminiService';
+import * as auth from './utils/auth';
+import AuthCallback from './pages/AuthCallback';
+import Projects from './pages/Projects';
+import Project from './pages/Project';
 
-type ViewState = 'overview' | 'history' | 'next' | 'costs' | 'details' | 'faq' | 'messaging' | 'admin';
+type ViewState = 'landing' | 'callback' | 'select-project' | 'access-ended' | 'overview' | 'history' | 'next' | 'costs' | 'details' | 'faq' | 'messaging' | 'admin';
 
 interface Message {
   senderType: 'customer' | 'internal' | 'installer' | 'system';
@@ -80,18 +89,74 @@ const STATUS_MAP: Record<string, string> = {
   'payment_received': 'Payment Received',
   'installation_scheduled': 'Installation Scheduled',
   'completed': 'Installation Completed',
-  'cancelled': 'Project Cancelled'
+  'cancelled': 'Project Cancelled',
+  'survey_scheduled': 'Site Survey Scheduled',
+  'quote_sent': 'Quote Sent',
+  'quote_accepted': 'Quote Accepted',
+  'awaiting_approval': 'Awaiting Approval',
+  'on_hold': 'On Hold',
+  'ready_to_schedule': 'Ready to Schedule',
+  'installation_in_progress': 'Installation In Progress',
+  'draft': 'Draft',
+  'lead': 'Lead',
+  'qualified': 'Qualified',
+  'unqualified': 'Unqualified',
+  'lost': 'Lost',
+  'won': 'Won',
+  'survey_requested': 'Survey Requested',
+  'survey_completed': 'Survey Completed',
+  'quote_requested': 'Quote Requested',
+  'quote_rejected': 'Quote Rejected',
+  'payment_requested': 'Payment Requested',
+  'installation_requested': 'Installation Requested',
+  'installation_completed': 'Installation Completed',
+  'handover_completed': 'Handover Completed',
+  'archived': 'Archived'
 };
 
-export default function App() {
+function getDisplayProjectType(p: any) {
+  const name = p.jobType || p.projectType || p.project_type || p.job_type || "EV Installation";
+  const lower = name.toLowerCase();
+  if (lower.includes('solar')) return 'Solar Installation';
+  if (lower.includes('residential')) return 'Residential EV';
+  if (lower.includes('commercial')) return 'Commercial EV';
+  if (lower.includes('fleet')) return 'Fleet Charging';
+  if (lower.includes('battery')) return 'Battery Storage';
+  return name;
+}
+
+function isProjectExpired(p: any) {
+  if (p.status !== 'completed') return false;
+  if (!p.completedAt) return false;
+  const completedDate = new Date(p.completedAt).getTime();
+  const now = Date.now();
+  const diffHours = (now - completedDate) / (1000 * 60 * 60);
+  return diffHours > 24;
+}
+
+export function Home() {
   const [token, setToken] = useState<string | null>(null);
-  const [assistantData, setAssistantData] = useState<AssistantResponse | null>(null);
   const [threadData, setThreadData] = useState<any>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [threadStatus, setThreadStatus] = useState<'open' | 'closed'>('open');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [currentView, setCurrentView] = useState<ViewState>('overview');
+  const [currentView, setCurrentView] = useState<ViewState>('landing');
+  const [email, setEmail] = useState('');
+  const [loginMessage, setLoginMessage] = useState<{ text: string, type: 'info' | 'error' | 'success', devMagicLink?: string } | null>(null);
+  const [demoResult, setDemoResult] = useState<{ text: string, devMagicLink?: string } | null>(null);
+  const [retrySeconds, setRetrySeconds] = useState(0);
+  const [jtProjects, setJtProjects] = useState<any[]>([]);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+
+  const parseDate = (dateStr: string) => {
+    if (!dateStr) return new Date();
+    // If it doesn't have a timezone indicator, assume UTC (SQLite default)
+    const normalized = (dateStr.includes('Z') || dateStr.includes('+') || dateStr.includes('-')) 
+      ? dateStr 
+      : dateStr.replace(' ', 'T') + 'Z';
+    return new Date(normalized);
+  };
   const [language, setLanguage] = useState<'English' | 'Spanish'>('English');
   const [newMessage, setNewMessage] = useState('');
   const [adminReply, setAdminReply] = useState('');
@@ -102,8 +167,9 @@ export default function App() {
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const [showScrollDown, setShowScrollDown] = useState(false);
   const [adminShowScrollDown, setAdminShowScrollDown] = useState(false);
-  const [adminProjectId, setAdminProjectId] = useState('');
+  const [adminEmail, setAdminEmail] = useState('');
   const [adminGeneratedLink, setAdminGeneratedLink] = useState('');
+  const [adminGenerating, setAdminGenerating] = useState(false);
   const [copying, setCopying] = useState(false);
   const [adminThreads, setAdminThreads] = useState<any[]>([]);
   const [adminSearchQuery, setAdminSearchQuery] = useState('');
@@ -235,7 +301,7 @@ export default function App() {
       socket.emit('join-thread', threadId);
       socket.on('new-message', (msg) => {
         setMessages(prev => {
-          if (prev.some(m => m.createdAt === msg.createdAt && m.body === msg.body)) return prev;
+          if (prev.some(m => m.id === msg.id)) return prev;
           return [...prev, msg];
         });
         
@@ -367,38 +433,269 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [currentView]);
 
+  // Handle routing and auth guards
   useEffect(() => {
     const path = window.location.pathname;
     const params = new URLSearchParams(window.location.search);
     const view = params.get('view');
+    const session = auth.getSession();
+    
+    const tokenParam = params.get('token');
+    const emailParam = params.get('email');
 
+    console.log('[Routing] Initializing...', { path, tokenParam, emailParam, sessionId: session.sessionId });
+
+    // Admin view is special
     if (path === '/admin' || view === 'admin') {
       setCurrentView('admin');
       setLoading(false);
       return;
     }
 
-    const tokenMatch = path.match(/^\/p\/([^\/]+)\/?$/);
-    const pId = params.get('projectId');
+    // If we are on a path handled by another component, do nothing here
+    if (path === '/auth/callback' || path === '/projects' || path.startsWith('/project/')) {
+      return;
+    }
 
+    // If we have a token or email in the URL, prioritize loading that data
+    // This handles demo links that might point to the root or /project
+    if (tokenParam || emailParam) {
+      const identifier = tokenParam || emailParam;
+      console.log('[Routing] Found identifier in URL:', identifier);
+      
+      // If it's a "real" magic link token on the callback path, redeem it
+      if (path === '/auth/callback' && tokenParam && !tokenParam.includes('@')) {
+        setCurrentView('callback');
+        handleRedeemToken(tokenParam);
+        return;
+      }
+
+      // If it's an email (either in emailParam or tokenParam), fetch all projects for it
+      if (identifier && identifier.includes('@')) {
+        setLoading(true);
+        auth.fetchProjectsByEmail(identifier).then(res => {
+          if (res.ok && res.projects && res.projects.length > 0) {
+            console.log('[Routing] Found projects for email:', res.projects.length);
+            setJtProjects(res.projects);
+            // Mock a session so the select-project view is accessible
+            localStorage.setItem("jt_sessionId", "demo_session");
+            localStorage.setItem("jt_projects", JSON.stringify(res.projects));
+            setSessionId("demo_session");
+            setCurrentView('select-project');
+          } else {
+            console.log('[Routing] No projects found for email, falling back to overview');
+            setToken(identifier);
+            loadCommsData(identifier);
+            setCurrentView('overview');
+          }
+        }).catch(err => {
+          console.error('[Routing] Error fetching projects by email:', err);
+          setToken(identifier);
+          loadCommsData(identifier);
+          setCurrentView('overview');
+        }).finally(() => setLoading(false));
+        return;
+      }
+
+      // Otherwise, treat it as a direct project access (demo mode)
+      setToken(identifier!);
+      loadCommsData(identifier!);
+      setCurrentView('overview');
+      return;
+    }
+
+    // Auth Callback (without token in params - should have been caught above)
+    if (path === '/auth/callback') {
+      window.location.href = '/access-ended';
+      return;
+    }
+
+    // Access Ended
+    if (path === '/access-ended') {
+      setCurrentView('access-ended');
+      auth.clearSession();
+      setLoading(false);
+      return;
+    }
+
+    // Select Project
+    if (path === '/select-project') {
+      if (!session.sessionId) {
+        window.location.href = '/';
+        return;
+      }
+      setCurrentView('select-project');
+      setJtProjects(session.projects);
+      setLoading(false);
+      return;
+    }
+
+    // Protected Project Routes
+    const projectMatch = path.match(/^\/project\/([^\/]+)\/?$/);
+    const isProjectBase = path === '/project';
+    const statusMatch = path === '/status';
+    const quoteMatch = path === '/quote';
+    const chatMatch = path === '/chat';
+
+    if (projectMatch || isProjectBase || statusMatch || quoteMatch || chatMatch) {
+      if (!session.sessionId) {
+        console.log('[Routing] No session found for protected route, redirecting to landing');
+        window.location.href = '/';
+        return;
+      }
+
+      const pId = projectMatch ? projectMatch[1] : session.selectedProjectId;
+      
+      if (!pId) {
+        window.location.href = '/select-project';
+        return;
+      }
+
+      // Check if project is expired
+      const project = session.projects.find((p: any) => p.projectId === pId);
+      if (project && isProjectExpired(project)) {
+        window.location.href = '/access-ended';
+        return;
+      }
+
+      // Update selected project if it changed in URL
+      if (pId !== session.selectedProjectId) {
+        localStorage.setItem('jt_selectedProjectId', pId);
+      }
+
+      setToken(pId);
+      setSessionId(session.sessionId);
+      loadCommsData(pId);
+      
+      if (statusMatch) setCurrentView('next');
+      else if (quoteMatch) setCurrentView('costs');
+      else if (chatMatch) setCurrentView('messaging');
+      else setCurrentView('overview');
+      
+      return;
+    }
+
+    // Legacy /p/:token support
+    const tokenMatch = path.match(/^\/p\/([^\/]+)\/?$/);
     if (tokenMatch) {
       const tkn = tokenMatch[1];
       setToken(tkn);
       loadCommsData(tkn);
-    } else if (pId) {
-      setToken(pId);
-      loadCommsData(pId);
-    } else {
-      // Default to demo project if no identifier is provided
-      const demoToken = 'DEMO-PROJECT-001';
-      setToken(demoToken);
-      loadCommsData(demoToken);
+      setCurrentView('overview');
+      return;
     }
+
+    // Default to landing
+    setCurrentView('landing');
+    setLoading(false);
   }, []);
 
-  async function loadCommsData(tkn: string) {
-    console.log('[App] Loading data for token:', tkn);
+  async function handleRedeemToken(token: string) {
     setLoading(true);
+    try {
+      const payload = await auth.redeemToken(token);
+      if (payload.ok !== true) {
+        window.location.href = '/access-ended';
+        return;
+      }
+
+      localStorage.setItem("jt_sessionId", payload.sessionId);
+      localStorage.setItem("jt_projects", JSON.stringify(payload.projects || []));
+      
+      const projects = payload.projects || [];
+      if (projects.length > 1) {
+        window.location.href = '/select-project';
+      } else if (projects.length === 1) {
+        const pId = projects[0].projectId;
+        if (isProjectExpired(projects[0])) {
+          window.location.href = '/access-ended';
+          return;
+        }
+        localStorage.setItem("jt_selectedProjectId", pId);
+        window.location.href = `/project/${pId}`;
+      } else {
+        window.location.href = '/access-ended';
+      }
+    } catch (err) {
+      console.error("Redeem error", err);
+      window.location.href = '/access-ended';
+    }
+  }
+
+  async function handleRequestLink(e?: React.FormEvent) {
+    if (e) e.preventDefault();
+    
+    const check = auth.canRequestLink();
+    if (!check.ok) {
+      setRetrySeconds(check.retryInSeconds);
+      setLoginMessage({ text: `Try again in ${check.retryInSeconds} seconds.`, type: 'error' });
+      return;
+    }
+
+    if (!email || !email.includes('@')) {
+      setLoginMessage({ text: "Please enter a valid email address.", type: 'error' });
+      return;
+    }
+
+    setSending(true);
+    try {
+      auth.markLinkRequested();
+      const payload = await auth.requestLoginLink(email);
+      setLoginMessage({ 
+        text: payload.message || "If an account exists for this email, you’ll receive a login link shortly.", 
+        type: 'success',
+        devMagicLink: payload.devMagicLink
+      });
+    } catch (err) {
+      setLoginMessage({ text: "If an account exists for this email, you’ll receive a login link shortly.", type: 'success' });
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function handleWrongEmail() {
+    auth.clearSession();
+    setEmail('');
+    setLoginMessage(null);
+  }
+
+  function handleLogout() {
+    auth.clearSession();
+    window.location.href = '/';
+  }
+
+  // Rate limit countdown
+  useEffect(() => {
+    if (retrySeconds > 0) {
+      const timer = setInterval(() => {
+        setRetrySeconds(s => s - 1);
+      }, 1000);
+      return () => clearInterval(timer);
+    }
+  }, [retrySeconds]);
+
+  async function loadCommsData(tkn: string, isBackground = false) {
+    console.log('[App] Loading data for token:', tkn, isBackground ? '(background)' : '');
+    
+    // Check for client-side cache first to show data immediately
+    if (!isBackground) {
+      const cached = sessionStorage.getItem(`jt_thread_${tkn}`);
+      if (cached) {
+        try {
+          const parsed = JSON.parse(cached);
+          setThreadId(parsed.threadId);
+          setThreadData(parsed);
+          setThreadStatus(parsed.threadStatus || 'open');
+          setMessages(parsed.messages || []);
+          setLoading(false);
+          isBackground = true; // Now we can just refresh in background
+        } catch (e) {}
+      }
+    }
+
+    if (!isBackground) {
+      setLoading(true);
+    }
     setError(null);
     try {
       const response = await fetch(`/api/comms/page/${tkn}`);
@@ -420,81 +717,8 @@ export default function App() {
       setThreadStatus(data.threadStatus || 'open');
       setMessages(data.messages || []);
       
-      let assistantResponse: AssistantResponse;
-      
-      // Special handling for demo project to be instant
-      const statusLabel = data.project.status ? (STATUS_MAP[data.project.status] || data.project.status.replace(/_/g, ' ')) : 'In Progress';
-      
-      if (tkn === 'DEMO-PROJECT-001') {
-        assistantResponse = {
-          en: {
-            customer_message: "Hi Demo! Your Easee One charger installation is moving along nicely. We've received your details and are currently reviewing your site survey.",
-            status_summary: `Current Status: ${statusLabel}`,
-            what_happened: ["Project created", "Details received", "Site survey submitted"],
-            what_happens_next: ["Site survey review", "Quote generation", "Installation scheduling"],
-            quote_total: "£849.00",
-            quote_items: ["Easee One Charger", "Standard Installation", "OZEV Grant Application"],
-            key_details: ["Charger: Easee One", `Status: ${statusLabel}`],
-            needs_info: []
-          },
-          es: {
-            customer_message: "¡Hola Demo! La instalación de tu cargador Easee One avanza a buen ritmo. Hemos recibido tus datos y estamos revisando tu encuesta del sitio.",
-            status_summary: `Estado actual: ${statusLabel}`,
-            what_happened: ["Proyecto creado", "Detalles recibidos", "Encuesta del sitio enviada"],
-            what_happens_next: ["Revisión de encuesta", "Generación de presupuesto", "Programación de instalación"],
-            quote_total: "£849.00",
-            quote_items: ["Cargador Easee One", "Instalación estándar", "Solicitud de subvención OZEV"],
-            key_details: ["Cargador: Easee One", `Estado: ${statusLabel}`],
-            needs_info: []
-          }
-        };
-      } else {
-        try {
-          // Try to get AI response with a timeout to prevent hanging
-          const aiPromise = generateAssistantResponse(data.project);
-          const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error('AI Timeout')), 8000)
-          );
-          assistantResponse = await Promise.race([aiPromise, timeoutPromise]) as AssistantResponse;
-          
-          // Override status summary if it's too generic
-          if (assistantResponse.en.status_summary.toLowerCase().includes('in progress')) {
-            assistantResponse.en.status_summary = `Current Status: ${statusLabel}`;
-          }
-          if (assistantResponse.es.status_summary.toLowerCase().includes('en progreso')) {
-            assistantResponse.es.status_summary = `Estado actual: ${statusLabel}`;
-          }
-        } catch (aiErr) {
-          console.warn('[App] AI Generation failed or timed out, using fallback:', aiErr);
-          // Basic fallback if AI fails or is too slow
-          assistantResponse = {
-            en: {
-              customer_message: `Hi ${data.project.firstName || 'there'}! We're working on your ${data.project.chargerType || 'EV charger'} installation.`,
-              status_summary: `Current Status: ${statusLabel}`,
-              what_happened: ["Project created", "Details received"],
-              what_happens_next: ["Site survey review", "Quote generation"],
-              quote_total: data.project.quote_total || "Calculating...",
-              quote_items: ["Standard Installation"],
-              key_details: [`Charger: ${data.project.chargerType || 'EV Charger'}`, `Status: ${statusLabel}`],
-              needs_info: []
-            },
-            es: {
-              customer_message: `¡Hola ${data.project.firstName || 'amigo'}! Estamos trabajando en la instalación de tu ${data.project.chargerType || 'cargador EV'}.`,
-              status_summary: `Estado actual: ${statusLabel}`,
-               what_happened: ["Proyecto creado", "Detalles recibidos"],
-              what_happens_next: ["Revisión de encuesta", "Generación de presupuesto"],
-              quote_total: data.project.quote_total || "Calculando...",
-              quote_items: ["Instalación estándar"],
-              key_details: [`Cargador: ${data.project.chargerType || 'Cargador EV'}`, `Estado: ${statusLabel}`],
-              needs_info: []
-            }
-          };
-        }
-      }
-
-      setAssistantData(assistantResponse);
-      setMessages(data.messages);
-      setThreadStatus(data.threadStatus);
+      // Cache for next time
+      sessionStorage.setItem(`jt_thread_${tkn}`, JSON.stringify(data));
       
       // Track unique page open
       const hasVisited = sessionStorage.getItem(`visited-${tkn}`);
@@ -504,7 +728,9 @@ export default function App() {
       }
     } catch (err: any) {
       console.error('[App] Error loading comms data:', err);
-      setError(err.message || 'An unexpected error occurred');
+      if (!isBackground) {
+        setError(err.message || 'An unexpected error occurred');
+      }
     } finally {
       setLoading(false);
     }
@@ -523,19 +749,21 @@ export default function App() {
     }
 
     setSending(true);
+    const body = newMessage.trim();
+    setNewMessage('');
     try {
       const response = await fetch(`/api/comms/message/${token}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ body: newMessage })
+        body: JSON.stringify({ body })
       });
 
       if (!response.ok) {
+        setNewMessage(body);
         const err = await response.json();
         throw new Error(err.error || 'Failed to send message');
       }
 
-      setNewMessage('');
       console.log('[Messaging] Message sent successfully');
     } catch (err: any) {
       console.error('[Messaging] Error sending message:', err);
@@ -577,7 +805,25 @@ export default function App() {
     );
   }
 
-  const data = assistantData ? (language === 'English' ? assistantData.en : assistantData.es) : null;
+  const data = threadData?.project ? {
+    customer_message: language === 'English' 
+      ? `Hi ${threadData.project.firstName || 'there'}! Your ${threadData.project.projectType || 'installation'} is moving along nicely. Here's your latest project overview.`
+      : `¡Hola ${threadData.project.firstName || 'amigo'}! Tu ${threadData.project.projectType || 'instalación'} está avanzando bien. Aquí tienes el resumen más reciente de tu proyecto.`,
+    status_summary: language === 'English'
+      ? `Current Status: ${threadData.project.status ? (STATUS_MAP[threadData.project.status] || threadData.project.status.replace(/_/g, ' ')) : 'In Progress'}`
+      : `Estado actual: ${threadData.project.status ? (STATUS_MAP[threadData.project.status] || threadData.project.status.replace(/_/g, ' ')) : 'En progreso'}`,
+    quote_total: threadData.project.quote_total || (language === 'English' ? '£0.00' : '£0.00'),
+    quote_items: language === 'English' 
+      ? [`${threadData.project.chargerType || 'EV Charger'} Installation`, "Standard Installation Package"]
+      : [`Instalación de ${threadData.project.chargerType || 'Cargador EV'}`, "Paquete de instalación estándar"],
+    key_details: language === 'English'
+      ? [`Project ID: ${threadData.project.projectId}`, `Project Type: ${getDisplayProjectType(threadData.project)}`, `Charger: ${threadData.project.chargerType || 'EV Charger'}`]
+      : [`ID del proyecto: ${threadData.project.projectId}`, `Tipo de proyecto: ${getDisplayProjectType(threadData.project)}`, `Cargador: ${threadData.project.chargerType || 'Cargador EV'}`],
+    what_happens_next: language === 'English'
+      ? ["Site survey review", "Quote generation", "Installation scheduling"]
+      : ["Revisión de encuesta", "Generación de presupuesto", "Programación de instalación"],
+    needs_info: []
+  } : null;
 
   return (
     <div className="min-h-screen bg-[#f0f9f9] text-slate-800 font-sans pb-12">
@@ -591,7 +837,7 @@ export default function App() {
         </div>
         
         <div className="flex items-center gap-4">
-          {currentView !== 'admin' && (
+          {currentView !== 'admin' && !['landing', 'callback', 'access-ended', 'select-project'].includes(currentView) && (
             <div className="flex bg-white p-1 rounded-full shadow-sm border border-teal-50">
               <button
                 onClick={() => setLanguage('English')}
@@ -616,7 +862,7 @@ export default function App() {
             </div>
           )}
           
-          {currentView !== 'overview' && currentView !== 'admin' && (
+          {currentView !== 'overview' && currentView !== 'admin' && !['landing', 'callback', 'access-ended', 'select-project'].includes(currentView) && (
             <button 
               onClick={() => setCurrentView('overview')}
               className="text-xs font-bold text-teal-600 uppercase tracking-widest"
@@ -624,11 +870,327 @@ export default function App() {
               {t.home}
             </button>
           )}
+
+          {sessionId && !['landing', 'callback', 'access-ended', 'select-project'].includes(currentView) && (
+            <button 
+              onClick={handleLogout}
+              className="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-red-500 transition-colors"
+              title="Logout"
+            >
+              <LogOut size={18} />
+            </button>
+          )}
         </div>
       </header>
 
       <main className={`${currentView === 'admin' ? 'max-w-5xl' : 'max-w-lg'} mx-auto px-6 pt-4`}>
         <AnimatePresence mode="wait">
+          {currentView === 'landing' && (
+            <motion.div
+              key="landing"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="max-w-md mx-auto pt-12 text-center"
+            >
+              <div className="mb-8">
+                <Mascot size="lg" />
+              </div>
+              <h1 className="text-3xl font-bold text-slate-900 mb-2">EV Installation Assistant</h1>
+              <p className="text-slate-500 mb-10">Check your project status, quote, and message your installer</p>
+
+              <div className="bg-white p-8 rounded-3xl shadow-sm border border-teal-50 text-left">
+                {!loginMessage ? (
+                  <form onSubmit={handleRequestLink} className="space-y-6">
+                    <div>
+                      <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">Email Address</label>
+                      <div className="relative">
+                        <Mail className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-300" size={18} />
+                        <input 
+                          type="email"
+                          value={email}
+                          onChange={(e) => setEmail(e.target.value)}
+                          placeholder="you@example.com"
+                          className="w-full bg-slate-50 border-none rounded-2xl pl-12 pr-4 py-4 text-slate-800 focus:ring-2 focus:ring-teal-500 transition-all"
+                          required
+                        />
+                      </div>
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={sending}
+                      className="w-full bg-teal-600 text-white py-4 rounded-2xl font-bold shadow-lg shadow-teal-100 active:scale-95 disabled:opacity-50 transition-all flex items-center justify-center gap-2"
+                    >
+                      {sending ? <Loader2 className="animate-spin" size={20} /> : "Send me a login link"}
+                    </button>
+                  </form>
+                ) : (
+                  <div className="text-center">
+                    <div className="w-16 h-16 bg-teal-50 rounded-full flex items-center justify-center mx-auto mb-6">
+                      <Mail className="text-teal-600" size={32} />
+                    </div>
+                    <h2 className="text-xl font-bold text-slate-800 mb-2">Check your email</h2>
+                    <p className="text-slate-500 text-sm mb-6">
+                      We've sent a secure login link to <span className="font-bold text-slate-700">{email}</span>.
+                    </p>
+                    
+                    <div className={`p-4 rounded-2xl text-sm mb-6 ${
+                      loginMessage.type === 'error' ? 'bg-red-50 text-red-600' : 'bg-teal-50 text-teal-700'
+                    }`}>
+                      {loginMessage.text}
+                      {loginMessage.devMagicLink && (
+                        <button 
+                          onClick={() => window.location.href = loginMessage.devMagicLink!}
+                          className="mt-3 w-full bg-white text-teal-600 border border-teal-100 py-2 rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-teal-50 transition-colors"
+                        >
+                          <ExternalLink size={16} />
+                          Login now (dev)
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="flex flex-col gap-3">
+                      <button 
+                        onClick={() => handleRequestLink()}
+                        disabled={sending}
+                        className="text-sm font-bold text-teal-600 hover:text-teal-700 transition-colors disabled:opacity-50"
+                      >
+                        {sending ? "Resending..." : "Resend link"}
+                      </button>
+                      <button 
+                        onClick={handleWrongEmail}
+                        className="text-sm font-bold text-slate-400 hover:text-slate-600 transition-colors"
+                      >
+                        Wrong email?
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="mt-12 pt-8 border-t border-slate-100">
+                <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4">Demo Access</p>
+                <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 text-left">
+                  <p className="text-xs text-slate-500 mb-3">Enter an email to simulate a magic link generation via n8n:</p>
+                  <div className="space-y-3">
+                    <div className="flex gap-2">
+                      <input 
+                        type="email"
+                        placeholder="test@example.com"
+                        className="flex-1 bg-white border border-slate-200 rounded-xl px-4 py-2 text-sm focus:ring-2 focus:ring-teal-500"
+                        id="demo-email-input"
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            const input = e.currentTarget as HTMLInputElement;
+                            setEmail(input.value);
+                            handleRequestLink();
+                          }
+                        }}
+                      />
+                      <button 
+                        onClick={() => {
+                          const input = document.getElementById('demo-email-input') as HTMLInputElement;
+                          if (input.value) {
+                            setEmail(input.value);
+                            setSending(true);
+                            setDemoResult(null);
+                            auth.requestLoginLink(input.value).then(payload => {
+                              setDemoResult({
+                                text: payload.message || "Link generated!",
+                                devMagicLink: payload.devMagicLink
+                              });
+                              setLoginMessage({ 
+                                text: payload.message || "Link generated!", 
+                                type: 'success',
+                                devMagicLink: payload.devMagicLink
+                              });
+                            }).catch(err => {
+                              setDemoResult({ text: "Failed to generate link. Check console." });
+                            }).finally(() => setSending(false));
+                          }
+                        }}
+                        className="bg-teal-600 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-teal-700 transition-colors"
+                      >
+                        Go
+                      </button>
+                    </div>
+                    
+                    {demoResult && (
+                      <div className="mt-4 p-3 bg-white rounded-xl border border-teal-100 animate-in fade-in slide-in-from-top-2 duration-300">
+                        <p className="text-[10px] font-bold text-teal-600 uppercase tracking-wider mb-2">Generated Link</p>
+                        {demoResult.devMagicLink ? (
+                          <div className="space-y-2">
+                            <div className="p-2 bg-slate-50 rounded-lg border border-slate-100 text-[10px] font-mono break-all text-slate-600">
+                              {demoResult.devMagicLink}
+                            </div>
+                            <div className="flex gap-2">
+                              <button 
+                                onClick={() => {
+                                  navigator.clipboard.writeText(demoResult.devMagicLink!);
+                                  setCopying(true);
+                                  setTimeout(() => setCopying(false), 2000);
+                                }}
+                                className="flex-1 bg-teal-50 text-teal-700 py-2 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1 hover:bg-teal-100 transition-colors"
+                              >
+                                {copying ? <CheckCircle2 size={12} /> : <Copy size={12} />}
+                                {copying ? "Copied!" : "Copy Link"}
+                              </button>
+                              <button 
+                                onClick={() => window.location.href = demoResult.devMagicLink!}
+                                className="flex-1 bg-teal-600 text-white py-2 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1 hover:bg-teal-700 transition-colors"
+                              >
+                                <ExternalLink size={12} />
+                                Open Now
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="text-xs text-slate-600">{demoResult.text}</p>
+                        )}
+                      </div>
+                    )}
+
+                    <div className="flex items-center gap-2 text-[10px] text-slate-400">
+                      <Info size={12} />
+                      <span>This hits the n8n webhook and displays the result here.</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          )}
+
+          {currentView === 'callback' && (
+            <motion.div
+              key="callback"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              className="flex flex-col items-center justify-center py-20 text-center"
+            >
+              <Loader2 className="animate-spin text-teal-600 mb-6" size={48} />
+              <h2 className="text-2xl font-bold text-slate-800 mb-2">Signing you in...</h2>
+              <p className="text-slate-500">Verifying your secure access link.</p>
+            </motion.div>
+          )}
+
+          {currentView === 'access-ended' && (
+            <motion.div
+              key="access-ended"
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              className="flex flex-col items-center justify-center py-20 text-center"
+            >
+              <div className="w-20 h-20 bg-red-50 rounded-full flex items-center justify-center mb-6">
+                <AlertCircle size={40} className="text-red-500" />
+              </div>
+              <h2 className="text-2xl font-bold text-slate-800 mb-2">Access ended</h2>
+              <p className="text-slate-500 max-w-xs mx-auto mb-10">
+                Your link expired or access was closed. Request a new login link to continue.
+              </p>
+              <button 
+                onClick={() => window.location.href = '/'}
+                className="bg-teal-600 text-white px-10 py-4 rounded-2xl font-bold shadow-lg shadow-teal-100 active:scale-95 transition-all"
+              >
+                Back to login
+              </button>
+            </motion.div>
+          )}
+
+          {currentView === 'select-project' && (
+            <motion.div
+              key="select-project"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="max-w-md mx-auto pt-12"
+            >
+              <h1 className="text-2xl font-bold text-slate-900 mb-2 text-center">Select your project</h1>
+              <p className="text-slate-500 mb-10 text-center">We found multiple projects associated with your account.</p>
+
+              <div className="space-y-4">
+                {jtProjects.map((p) => {
+                  const expired = isProjectExpired(p);
+                  return (
+                    <button
+                      key={p.projectId}
+                      disabled={expired}
+                      onClick={() => {
+                        localStorage.setItem("jt_selectedProjectId", p.projectId);
+                        window.location.href = `/project/${p.projectId}`;
+                      }}
+                      className={`w-full p-6 rounded-3xl shadow-sm border text-left transition-all group flex items-center justify-between ${
+                        expired 
+                          ? 'bg-slate-50 border-slate-100 opacity-60 cursor-not-allowed' 
+                          : 'bg-white border-teal-50 hover:border-teal-200'
+                      }`}
+                    >
+                      <div>
+                        <div className="flex items-center gap-2 mb-1">
+                          <h3 className={`font-bold ${expired ? 'text-slate-400' : 'text-slate-800'}`}>
+                            {getDisplayProjectType(p)}
+                          </h3>
+                          {expired && (
+                            <span className="text-[10px] bg-slate-200 text-slate-500 px-2 py-0.5 rounded-full font-medium uppercase tracking-wider">
+                              Expired
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className={`w-2 h-2 rounded-full ${
+                            expired ? 'bg-slate-300' : (p.status === 'completed' || p.status === 'installation_completed' || p.status === 'won' ? 'bg-emerald-500' : 'bg-amber-500')
+                          }`} />
+                          <span className={`text-xs capitalize ${expired ? 'text-slate-400' : 'text-slate-500'}`}>
+                            {STATUS_MAP[p.status] || p.status?.replace(/_/g, ' ') || 'In Progress'}
+                            {expired && ' (Access Ended)'}
+                          </span>
+                        </div>
+                        {p.projectId.startsWith('PROJ-') && (
+                          <p className={`text-[10px] mt-2 ${expired ? 'text-slate-300' : 'text-slate-300'}`}>
+                            ID: {p.projectId}
+                          </p>
+                        )}
+                      </div>
+                      {!expired && (
+                        <ChevronRight className="text-slate-300 group-hover:text-teal-500 transition-colors" size={24} />
+                      )}
+                      {expired && (
+                        <Clock className="text-slate-300" size={20} />
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="mt-12 text-center">
+                <button 
+                  onClick={handleLogout}
+                  className="text-sm font-bold text-slate-400 hover:text-slate-600 transition-colors"
+                >
+                  Back to login
+                </button>
+              </div>
+
+              <div className="mt-12 pt-8 border-t border-slate-100">
+                <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4 text-center">Demo Access</p>
+                <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 text-left">
+                  <p className="text-xs text-slate-500 mb-3">Magic link for this test account:</p>
+                  <div className="flex gap-2">
+                    <button 
+                      onClick={() => {
+                        navigator.clipboard.writeText(`${window.location.origin}/auth/callback?token=JUMP-TEST-2026`);
+                        alert('Link copied to clipboard!');
+                      }}
+                      className="flex-1 bg-white border border-teal-100 text-teal-600 py-3 rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:bg-teal-50 transition-colors"
+                    >
+                      <Copy size={16} />
+                      Copy Magic Link
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          )}
+
           {error === 'expired' && (
             <motion.div
               key="expired"
@@ -646,7 +1208,7 @@ export default function App() {
             </motion.div>
           )}
 
-          {currentView === 'overview' && token && assistantData && error !== 'expired' && (
+          {currentView === 'overview' && token && threadData && error !== 'expired' && (
             <motion.div
               key="overview"
               initial={{ opacity: 0, y: 20 }}
@@ -822,7 +1384,7 @@ export default function App() {
                                 }`}>
                                   {msg.body}
                                   <div className={`text-[10px] mt-1 opacity-60 ${msg.senderType === 'customer' ? 'text-right' : 'text-left'}`}>
-                                    {new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                    {parseDate(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                                   </div>
                                 </div>
                                 <span className={`text-[9px] mt-1 font-bold uppercase tracking-wider ${msg.senderType === 'customer' ? 'text-right text-teal-600' : 'text-left text-slate-400'}`}>
@@ -1023,10 +1585,10 @@ export default function App() {
                                 <span className="font-bold text-slate-800 text-sm truncate max-w-[140px]">{t.customerName || 'Unknown Customer'}</span>
                                 <div className="flex flex-col items-end">
                                   <span className="text-[10px] text-slate-400 whitespace-nowrap">
-                                    {new Date(t.lastMessageAt).toLocaleDateString([], { month: 'short', day: 'numeric' })}
+                                    {parseDate(t.lastMessageAt).toLocaleDateString([], { month: 'short', day: 'numeric' })}
                                   </span>
                                   {(() => {
-                                    const diff = Date.now() - new Date(t.lastMessageAt).getTime();
+                                    const diff = Date.now() - parseDate(t.lastMessageAt).getTime();
                                     const mins = Math.floor(diff / 60000);
                                     let color = 'text-slate-400';
                                     if (mins >= 60) color = 'text-red-500';
@@ -1132,7 +1694,7 @@ export default function App() {
                           <span className="text-[10px] text-slate-300">•</span>
                           <p className="text-[10px] text-slate-500 uppercase tracking-wider">
                             Last activity: {(() => {
-                              const diff = Date.now() - new Date(adminSelectedThread.thread.lastMessageAt).getTime();
+                              const diff = Date.now() - parseDate(adminSelectedThread.thread.lastMessageAt).getTime();
                               const mins = Math.floor(diff / 60000);
                               if (mins < 1) return 'Just now';
                               if (mins < 60) return `${mins}m ago`;
@@ -1175,7 +1737,7 @@ export default function App() {
                     {/* Waiting On Banner */}
                     {(() => {
                       const thread = adminSelectedThread.thread;
-                      const diff = Date.now() - new Date(thread.lastMessageAt).getTime();
+                      const diff = Date.now() - parseDate(thread.lastMessageAt).getTime();
                       const hours = diff / 3600000;
                       const isOverdue = hours > 24;
                       
@@ -1243,7 +1805,7 @@ export default function App() {
                               }`}>
                                 {msg.body}
                                 <div className={`text-[9px] mt-1 opacity-60 ${msg.senderType === 'customer' ? 'text-slate-400' : 'text-teal-100'}`}>
-                                  {new Date(msg.createdAt).toLocaleTimeString()}
+                                  {parseDate(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                                 </div>
                               </div>
                             </div>
@@ -1306,20 +1868,22 @@ export default function App() {
                           disabled={adminSending || !adminReply.trim()}
                           onClick={async () => {
                             if (!adminReply.trim() || adminSending) return;
+                            const body = adminReply.trim();
+                            setAdminReply('');
                             setAdminSending(true);
                             try {
                               console.log('[Admin] Sending message to thread:', adminSelectedThread.thread.id);
                               const res = await fetch(`/api/admin/message/${adminSelectedThread.thread.id}`, {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ body: adminReply })
+                                body: JSON.stringify({ body })
                               });
                               
                               if (!res.ok) {
+                                setAdminReply(body);
                                 throw new Error('Failed to send message');
                               }
                               
-                              setAdminReply('');
                               // Refresh thread data
                               const refreshRes = await fetch(`/api/admin/thread/${adminSelectedThread.thread.id}`);
                               const refreshedData = await refreshRes.json();
@@ -1551,5 +2115,22 @@ function Mascot({ size = 'md', animate = false }: { size?: 'sm' | 'md' | 'lg', a
         <path d="M50 72L47 80H53L50 88" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
       </svg>
     </motion.div>
+  );
+}
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<Home />} />
+        <Route path="/admin" element={<Home />} />
+        <Route path="/auth/callback" element={<AuthCallback />} />
+        <Route path="/projects" element={<Projects />} />
+        <Route path="/project/:projectId" element={<Project />} />
+        <Route path="/status" element={<Home />} />
+        <Route path="/quote" element={<Home />} />
+        <Route path="/chat" element={<Home />} />
+      </Routes>
+    </BrowserRouter>
   );
 }

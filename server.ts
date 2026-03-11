@@ -114,6 +114,182 @@ async function startServer() {
     res.json({ status: "ok", message: "Express is responding" });
   });
 
+  // Proxy for n8n check-customer
+  app.post("/api/auth/check-customer", async (req, res) => {
+    try {
+      const { email } = req.body;
+      const n8nUrl = process.env.VITE_N8N_WEBHOOK_URL || "https://n8n.dev.jumptech.tools/webhook/check-customer";
+      
+      console.log(`[Proxy] Calling n8n check-customer for: ${email} at ${n8nUrl}`);
+      const response = await fetch(n8nUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          email, 
+          customerEmail: email, 
+          customer_email: email,
+          emailAddress: email,
+          email_address: email,
+          customer_email_address: email
+        }),
+      });
+      
+      const data = await response.json();
+      console.log(`[Proxy] n8n check-customer response:`, JSON.stringify(data).substring(0, 200));
+      res.json(data);
+    } catch (error) {
+      console.error("Error proxying n8n check-customer:", error);
+      res.status(500).json({ error: "Failed to connect to n8n" });
+    }
+  });
+
+  // Proxy for n8n redeem
+  app.post("/api/auth/redeem", async (req, res) => {
+    try {
+      const { token } = req.body;
+      const n8nUrl = "https://n8n.dev.jumptech.tools/webhook/auth/redeem";
+      
+      console.log(`[Proxy] Calling n8n redeem for token`);
+      const response = await fetch(n8nUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token }),
+      });
+      
+      const data = await response.json();
+      res.json(data);
+    } catch (error) {
+      console.error("Error proxying n8n redeem:", error);
+      res.status(500).json({ error: "Failed to connect to n8n" });
+    }
+  });
+
+  // Fetch projects by email (for demo and real use)
+  app.get("/api/auth/projects-by-email/:email", async (req, res) => {
+    try {
+      const { email } = req.params;
+      console.log(`[Server] Fetching projects for email: ${email}`);
+
+      // 1. Try real Jumptech API first if configured
+      const apiKey = process.env.JUMPTECH_API_KEY?.replace(/['"]/g, '').trim();
+      const apiUrl = (process.env.JUMPTECH_API_URL || 'https://api.jumptech.co.uk').replace(/\/$/, '');
+      
+      let allProjects: any[] = [];
+
+      if (apiKey && apiKey !== 'YOUR_JUMPTECH_API_KEY') {
+        try {
+          console.log(`[Server] Calling Jumptech API for projects by email: ${email}`);
+          // Try multiple common query parameters
+          const queries = ['customerEmail', 'email', 'customer_email'];
+          for (const q of queries) {
+            const response = await fetch(`${apiUrl}/projects?${q}=${encodeURIComponent(email)}`, {
+              headers: { 'Authorization': apiKey, 'Accept': 'application/json' }
+            });
+            if (response.ok) {
+              const data = await response.json();
+              const found = Array.isArray(data) ? data : (data.projects || data.data || []);
+              if (Array.isArray(found) && found.length > 0) {
+                allProjects = [...allProjects, ...found];
+              }
+            }
+          }
+        } catch (error) {
+          console.error(`Jumptech API error for email ${email}:`, error);
+        }
+      }
+
+      // 2. Try n8n check-customer
+      if (allProjects.length === 0) {
+        const n8nUrl = process.env.VITE_N8N_WEBHOOK_URL || "https://n8n.dev.jumptech.tools/webhook/check-customer";
+        console.log(`[Server] Calling n8n check-customer for: ${email} at ${n8nUrl}`);
+        try {
+          const response = await fetch(n8nUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 
+              email, 
+              customerEmail: email, 
+              customer_email: email,
+              emailAddress: email,
+              email_address: email,
+              customer_email_address: email
+            }),
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            console.log(`[Server] n8n response for ${email}:`, JSON.stringify(data).substring(0, 200));
+            
+            if (Array.isArray(data)) {
+              allProjects = data;
+            } else if (data && data.projects && Array.isArray(data.projects)) {
+              allProjects = data.projects;
+            } else if (data && (data.projectId || data.id || data.firstName || data.customerFirstName)) {
+              allProjects = [data];
+            } else if (data && typeof data === 'object') {
+              // Look for any array in the object
+              const arrays = Object.values(data).filter(v => Array.isArray(v));
+              if (arrays.length > 0) {
+                allProjects = arrays[0] as any[];
+              }
+            }
+          }
+        } catch (n8nErr) {
+          console.error(`n8n error for email ${email}:`, n8nErr);
+        }
+      }
+
+      // 3. Fallback for demo emails
+      if (allProjects.length === 0 && (email.toLowerCase().includes('demo') || email.toLowerCase().includes('test') || email.toLowerCase().includes('jumptech'))) {
+        allProjects = [
+          { 
+            projectId: "DEMO-PROJECT-001", 
+            projectType: "Residential EV", 
+            status: "in_progress",
+            jobType: "US Residential Installation",
+            chargerType: "Easee One",
+            firstName: "Demo",
+            lastName: "Customer"
+          },
+          { 
+            projectId: "DEMO-PROJECT-002", 
+            projectType: "Commercial", 
+            status: "ready_for_survey",
+            jobType: "Commercial Solar Array",
+            chargerType: "Tesla Wall Connector",
+            firstName: "Demo",
+            lastName: "Customer"
+          }
+        ];
+      }
+      
+      // Deduplicate by projectId
+      const uniqueProjects = Array.from(new Map(allProjects.map(p => [p.projectId || p.id || p.project_id || p.jobId, p])).values());
+
+      // Normalize project objects
+      const normalizedProjects = uniqueProjects.map((p: any) => {
+        const firstName = p.firstName || p.customerFirstName || p.customer_first_name || p.first_name || p.FirstName || p.CustomerFirstName || (p.customer_name ? p.customer_name.split(' ')[0] : "Customer");
+        const lastName = p.lastName || p.customerLastName || p.customer_last_name || p.last_name || p.LastName || p.CustomerLastName || (p.customer_name ? p.customer_name.split(' ').slice(1).join(' ') : "");
+        
+        return {
+          ...p,
+          projectId: p.projectId || p.id || p.project_id || p.jobId || p.job_id || p.ProjectID || p.ID,
+          firstName,
+          lastName,
+          status: p.status || p.projectStatus || p.project_status || p.jobStatus || p.job_status || p.Status || p.ProjectStatus || "in_progress",
+          jobType: p.jobType || p.projectType || p.project_type || p.job_type || p.JobType || p.ProjectType || "EV Installation",
+          chargerType: p.chargerType || p.charger_type || p.ChargerType || p.hardware || "EV Charger"
+        };
+      });
+
+      console.log(`[Server] Found ${normalizedProjects.length} projects for ${email}`);
+      res.json({ ok: true, projects: normalizedProjects });
+    } catch (error) {
+      console.error("Error fetching projects by email:", error);
+      res.status(500).json({ error: "Failed to fetch projects" });
+    }
+  });
+
   // Renamed route back to /api/project as requested, but keeping debug headers
   app.get("/api/project/:id", async (req, res) => {
     const { id } = req.params;
@@ -130,25 +306,101 @@ async function startServer() {
 
   // --- Project Comms API ---
 
-  // Helper: Fetch Project from Jumptech with Mock Fallback
+  // Helper: Fetch Project from Jumptech with n8n Fallback
   async function fetchJumptechProject(id: string) {
-    // For demo purposes, always return mock data if no real API is configured
     const apiKey = process.env.JUMPTECH_API_KEY?.replace(/['"]/g, '').trim();
     const apiUrl = (process.env.JUMPTECH_API_URL || 'https://api.jumptech.co.uk').replace(/\/$/, '');
     
-    if (!apiKey || apiKey === 'YOUR_JUMPTECH_API_KEY') {
-      return getMockProject(id);
+    // 1. Try real Jumptech API first if configured
+    if (apiKey && apiKey !== 'YOUR_JUMPTECH_API_KEY') {
+      try {
+        console.log(`[Server] Calling Jumptech API for project: ${id}`);
+        const response = await fetch(`${apiUrl}/projects/project/${id}`, {
+          headers: { 'Authorization': apiKey, 'Accept': 'application/json' }
+        });
+        if (response.ok) {
+          const data = await response.json();
+          return { 
+            ...data, 
+            id: data.id || id,
+            firstName: data.firstName || data.customerFirstName || "Customer",
+            lastName: data.lastName || data.customerLastName || "",
+            status: data.status || data.projectStatus || "in_progress"
+          };
+        }
+      } catch (error) {
+        console.error(`Jumptech API error for ${id}:`, error);
+      }
     }
 
+    // 2. Fallback: Try n8n webhook for project details
     try {
-      const response = await fetch(`${apiUrl}/projects/project/${id}`, {
-        headers: { 'Authorization': apiKey, 'Accept': 'application/json' }
+      const n8nUrl = process.env.VITE_N8N_PROJECT_URL || "https://n8n.dev.jumptech.tools/webhook/get-project";
+      console.log(`[Server] Trying n8n fallback for project: ${id} at ${n8nUrl}`);
+      
+      const n8nResponse = await fetch(n8nUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          projectId: id, 
+          id: id, 
+          project_id: id, 
+          jobId: id,
+          job_id: id,
+          ProjectID: id,
+          ID: id
+        }),
       });
-      if (!response.ok) return getMockProject(id);
-      return await response.json();
-    } catch (error) {
-      return getMockProject(id);
+      
+      if (n8nResponse.ok) {
+        const n8nData = await n8nResponse.ok ? await n8nResponse.json() : null;
+        if (n8nData) {
+          const project = Array.isArray(n8nData) ? n8nData[0] : n8nData;
+          if (project && (project.projectId || project.id || project.firstName || project.customerFirstName || project.customer_first_name || project.customer_name)) {
+            console.log(`[Server] Successfully fetched project ${id} from n8n`);
+            
+            const firstName = project.firstName || project.customerFirstName || project.customer_first_name || project.first_name || (project.customer_name ? project.customer_name.split(' ')[0] : "Customer");
+            const lastName = project.lastName || project.customerLastName || project.customer_last_name || project.last_name || (project.customer_name ? project.customer_name.split(' ').slice(1).join(' ') : "");
+            
+            return {
+              ...project,
+              id: project.id || project.projectId || project.project_id || id,
+              firstName,
+              lastName,
+              status: project.status || project.projectStatus || project.project_status || project.jobStatus || project.job_status || "in_progress"
+            };
+          }
+        }
+      }
+    } catch (n8nError) {
+      console.error(`n8n fallback error for ${id}:`, n8nError);
     }
+
+    // 3. Try check-customer as a last resort if id looks like an email
+    if (id.includes('@')) {
+      try {
+        const n8nUrl = process.env.VITE_N8N_WEBHOOK_URL || "https://n8n.dev.jumptech.tools/webhook/check-customer";
+        const response = await fetch(n8nUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: id, customerEmail: id }),
+        });
+        const data = await response.json();
+        const project = Array.isArray(data) ? data[0] : (data.projects ? data.projects[0] : data);
+        if (project && (project.projectId || project.id || project.firstName)) {
+          return {
+            ...project,
+            id: project.id || project.projectId || id,
+            firstName: project.firstName || project.customerFirstName || "Customer",
+            lastName: project.lastName || project.customerLastName || "",
+            status: project.status || project.projectStatus || "in_progress"
+          };
+        }
+      } catch (e) {}
+    }
+
+    // 4. Final fallback to mock
+    return getMockProject(id);
   }
 
   function getMockProject(id: string) {
@@ -172,18 +424,63 @@ async function startServer() {
       const { token: identifier } = req.params;
 
       let thread = db.prepare('SELECT * FROM threads WHERE token = ?').get(identifier) as any;
+      let projectData: any = null;
       
       if (!thread) {
         // Try as projectId
         thread = db.prepare('SELECT * FROM threads WHERE projectId = ?').get(identifier) as any;
         
+        if (!thread && identifier.includes('@')) {
+          // It's an email - try to find real projects first
+          try {
+            const n8nUrl = process.env.VITE_N8N_WEBHOOK_URL || "https://n8n.dev.jumptech.tools/webhook/check-customer";
+            const response = await fetch(n8nUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ 
+                email: identifier, 
+                customerEmail: identifier,
+                customer_email: identifier,
+                emailAddress: identifier,
+                email_address: identifier
+              }),
+            });
+            const data = await response.json();
+            const projects = Array.isArray(data) ? data : (data.projects || [data]);
+            const firstProject = projects[0];
+            
+            if (firstProject && (firstProject.projectId || firstProject.id)) {
+              const pId = firstProject.projectId || firstProject.id;
+              const newToken = crypto.randomBytes(32).toString('hex');
+              const customerName = `${firstProject.firstName || firstProject.customerFirstName || 'Customer'} ${firstProject.lastName || firstProject.customerLastName || ''}`.trim();
+              const result = db.prepare('INSERT INTO threads (projectId, token, customerName) VALUES (?, ?, ?)').run(pId, newToken, customerName);
+              thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(result.lastInsertRowid) as any;
+            }
+          } catch (e) {
+            console.error('Failed to fetch real project for email in page load:', e);
+          }
+
+          if (!thread) {
+            // Fallback to demo project if no real project found
+            const demoProjectId = 'DEMO-PROJECT-001';
+            thread = db.prepare('SELECT * FROM threads WHERE projectId = ?').get(demoProjectId) as any;
+            
+            if (!thread) {
+              const newToken = crypto.randomBytes(32).toString('hex');
+              const result = db.prepare('INSERT INTO threads (projectId, token, customerName) VALUES (?, ?, ?)').run(demoProjectId, newToken, 'Demo Customer');
+              thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(result.lastInsertRowid) as any;
+            }
+          }
+        }
+        
         if (!thread) {
           // Create a new thread on the fly for this project ID to allow access
           const newToken = crypto.randomBytes(32).toString('hex');
           try {
-            const projectData: any = await fetchJumptechProject(identifier);
+            projectData = await fetchJumptechProject(identifier);
             const customerName = `${projectData.firstName} ${projectData.lastName}`;
-            const result = db.prepare('INSERT INTO threads (projectId, token, customerName) VALUES (?, ?, ?)').run(identifier, newToken, customerName);
+            const isoNow = new Date().toISOString();
+            const result = db.prepare('INSERT INTO threads (projectId, token, customerName, projectData, projectDataUpdatedAt, createdAt, lastMessageAt) VALUES (?, ?, ?, ?, ?, ?, ?)').run(identifier, newToken, customerName, JSON.stringify(projectData), isoNow, isoNow, isoNow);
             thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(result.lastInsertRowid) as any;
             updateStats({ linksSent: 1 });
           } catch (err) {
@@ -192,7 +489,27 @@ async function startServer() {
         }
       }
 
-      const projectData: any = await fetchJumptechProject(thread.projectId);
+      if (!projectData) {
+        // Check cache
+        const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+        const now = new Date().getTime();
+        const updatedAt = thread.projectDataUpdatedAt ? new Date(thread.projectDataUpdatedAt).getTime() : 0;
+
+        if (thread.projectData && (now - updatedAt < CACHE_TTL)) {
+          try {
+            projectData = JSON.parse(thread.projectData);
+          } catch (e) {
+            console.error('Failed to parse cached projectData:', e);
+          }
+        }
+
+        if (!projectData) {
+          projectData = await fetchJumptechProject(thread.projectId);
+          // Update cache
+          db.prepare('UPDATE threads SET projectData = ?, projectDataUpdatedAt = ? WHERE id = ?')
+            .run(JSON.stringify(projectData), new Date().toISOString(), thread.id);
+        }
+      }
       
       // Check for expiry: 24 hours after completedAt
       if (thread.expiresAt && new Date() > new Date(thread.expiresAt)) {
@@ -240,13 +557,28 @@ async function startServer() {
       if (!thread) {
         thread = db.prepare('SELECT * FROM threads WHERE projectId = ?').get(identifier) as any;
       }
-      if (!thread) return res.status(404).json({ error: 'Project not found.' });
+      
+      if (!thread) {
+        // Create thread on the fly if it doesn't exist but project does
+        try {
+          const projectData: any = await fetchJumptechProject(identifier);
+          const newToken = crypto.randomBytes(32).toString('hex');
+          const customerName = `${projectData.firstName} ${projectData.lastName}`;
+          const isoNow = new Date().toISOString();
+          const result = db.prepare('INSERT INTO threads (projectId, token, customerName, createdAt, lastMessageAt) VALUES (?, ?, ?, ?, ?)').run(identifier, newToken, customerName, isoNow, isoNow);
+          thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(result.lastInsertRowid) as any;
+          updateStats({ linksSent: 1 });
+        } catch (err) {
+          return res.status(404).json({ error: 'Project not found.' });
+        }
+      }
 
       const category = categorizeMessage(body);
-      const result = db.prepare('INSERT INTO messages (threadId, senderType, body, category) VALUES (?, ?, ?, ?)').run(thread.id, 'customer', body, category);
+      const isoNow = new Date().toISOString();
+      const result = db.prepare('INSERT INTO messages (threadId, senderType, body, category, createdAt) VALUES (?, ?, ?, ?, ?)').run(thread.id, 'customer', body, category, isoNow);
       const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(result.lastInsertRowid) as any;
 
-      db.prepare("UPDATE threads SET lastMessageAt = CURRENT_TIMESTAMP, lastMessageText = ?, lastMessageSender = 'customer', needsResponse = 1, unreadForInstaller = 1 WHERE id = ?").run(body, thread.id);
+      db.prepare("UPDATE threads SET lastMessageAt = ?, lastMessageText = ?, lastMessageSender = 'customer', needsResponse = 1, unreadForInstaller = 1 WHERE id = ?").run(isoNow, body, thread.id);
       
       const now = new Date();
       const hour = now.getHours();
@@ -274,11 +606,12 @@ async function startServer() {
 
       if (isOutsideBusinessHours && canSendAuto) {
         const autoBody = "Thanks for your message! Our team is currently offline. We'll respond during business hours.";
-        const autoResult = db.prepare('INSERT INTO messages (threadId, senderType, body, autoGenerated) VALUES (?, ?, ?, 1)').run(thread.id, 'installer', autoBody);
+        const autoIsoNow = new Date().toISOString();
+        const autoResult = db.prepare('INSERT INTO messages (threadId, senderType, body, autoGenerated, createdAt) VALUES (?, ?, ?, 1, ?)').run(thread.id, 'installer', autoBody, autoIsoNow);
         const autoMessage = db.prepare('SELECT * FROM messages WHERE id = ?').get(autoResult.lastInsertRowid) as any;
         
-        db.prepare("UPDATE threads SET lastMessageAt = CURRENT_TIMESTAMP, lastMessageText = ?, lastMessageSender = 'installer', needsResponse = 0, unreadForCustomer = 1, lastAutoResponseAt = CURRENT_TIMESTAMP WHERE id = ?")
-          .run(autoBody, thread.id);
+        db.prepare("UPDATE threads SET lastMessageAt = ?, lastMessageText = ?, lastMessageSender = 'installer', needsResponse = 0, unreadForCustomer = 1, lastAutoResponseAt = ? WHERE id = ?")
+          .run(autoBody, autoIsoNow, autoIsoNow, thread.id);
         
         const finalThread = db.prepare('SELECT * FROM threads WHERE id = ?').get(thread.id) as any;
         
@@ -332,10 +665,11 @@ async function startServer() {
         responseTime = Math.floor((Date.now() - lastMsgDate.getTime()) / 1000);
       }
 
-      const result = db.prepare('INSERT INTO messages (threadId, senderType, body, responseTime) VALUES (?, ?, ?, ?)').run(tId, 'installer', body, responseTime);
+      const isoNow = new Date().toISOString();
+      const result = db.prepare('INSERT INTO messages (threadId, senderType, body, responseTime, createdAt) VALUES (?, ?, ?, ?, ?)').run(tId, 'installer', body, responseTime, isoNow);
       const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(result.lastInsertRowid) as any;
 
-      db.prepare("UPDATE threads SET lastMessageAt = CURRENT_TIMESTAMP, lastMessageText = ?, lastMessageSender = 'installer', needsResponse = 0, unreadForCustomer = 1 WHERE id = ?").run(body, tId);
+      db.prepare("UPDATE threads SET lastMessageAt = ?, lastMessageText = ?, lastMessageSender = 'installer', needsResponse = 0, unreadForCustomer = 1 WHERE id = ?").run(isoNow, body, tId);
       
       updateStats({ 
         installerMessages: 1,
